@@ -1,0 +1,590 @@
+import { ChatOpenAI } from "@langchain/openai";
+import {
+  HumanMessage,
+  AIMessage,
+  BaseMessage,
+  SystemMessage,
+} from "@langchain/core/messages";
+import {
+  StateGraph,
+  MessagesState,
+  END,
+  START,
+} from "@langchain/langgraph";
+import { z } from "zod"; // Per definire lo schema dell'output strutturato
+
+// -----------------------------------------------------------------------------_/
+// 1. Definizioni di Stato e Tipi
+// ----------------------------------------------------------------------------- */
+
+interface SearchDealsData {
+  location?: string;
+  location_confirmed?: boolean;
+  date?: string; // YYYY-MM-DD
+  date_confirmed?: boolean;
+  time?: string; // HH:MM
+  time_confirmed?: boolean;
+  max_cost?: number;
+  max_cost_confirmed?: boolean; // Traccia se il costo è stato chiesto/gestito
+  last_asked_param?: "location" | "date" | "time" | "max_cost" | "final_confirmation" | null;
+}
+
+interface NLUOutput {
+    intent: "search_deals" | "greetings" | "generic_chat" | "other";
+    entities: {
+        location?: string; 
+        date?: string;     
+        time?: string;     
+        max_cost?: string; 
+    };
+    original_query: string;
+}
+
+// Schema Zod per l'interpretazione dell'input utente in processUserInputNode
+const UserInputAction = z.enum([
+  "confirm_assumption",
+  "deny_assumption",
+  "provide_value",
+  "skip_parameter",
+  "request_clarification",
+  "unclear_or_off_topic",
+  "provide_location_specific",
+  "provide_date_specific",
+  "provide_time_specific",
+  "provide_cost_specific",
+  "confirm_final_parameters",
+  "deny_final_parameters_request_modification"
+]);
+
+const userInputInterpretationSchema = z.object({
+  action: UserInputAction.describe("L'azione principale interpretata dalla risposta dell'utente."),
+  value: z.string().optional()
+    .describe("Il valore specifico fornito dall'utente, se applicabile (es. nome del luogo, data, ora, importo). Per le conferme/negazioni di assunzioni, questo campo potrebbe non essere presente o rilevante."),
+  parameter_context: z.enum(["location", "date", "time", "max_cost", "final_confirmation", "none"])
+    .describe("Il contesto del parametro a cui si riferisce la risposta dell'utente, basato sull'ultima domanda dell'agente.")
+});
+type UserInputInterpretation = z.infer<typeof userInputInterpretationSchema>;
+
+interface AgentState extends MessagesState {
+  nluOutput?: NLUOutput;
+  searchDealsData: SearchDealsData;
+  is_awaiting_confirmation?: boolean;
+  confirmation_type?: "location_nearby" | "date_today" | "final_params";
+  last_agent_question?: string;
+}
+
+// -----------------------------------------------------------------------------_/
+// 2. Inizializzazione del Modello LLM
+// ----------------------------------------------------------------------------- */
+const llm = new ChatOpenAI({ modelName: "gpt-3.5-turbo-0125", temperature: 0.7 }); // Aumentata leggermente la temperatura per risposte più varie
+
+// -----------------------------------------------------------------------------_/
+// 3. Implementazione dei Nodi del Grafo
+// ----------------------------------------------------------------------------- */
+
+const nluSchema = z.object({
+  intent: z.enum(["search_deals", "greetings", "generic_chat", "other"])
+    .describe("L'intento principale dell'utente. Usa 'search_deals' se l'utente vuole trovare offerte o prenotare servizi. Usa 'greetings' per saluti. Usa 'generic_chat' per conversazioni generiche non legate a compiti specifici. Altrimenti usa 'other'."),
+  entities: z.object({
+    location: z.string().optional().describe("Il luogo menzionato per la ricerca di offerte, es. 'Roma', 'vicino a me'. Non normalizzare 'vicino a me'."),
+    date: z.string().optional().describe("La data menzionata, es. 'oggi', 'domani', '25 dicembre', '2024-12-25'. Non normalizzare 'oggi' o 'domani'."),
+    time: z.string().optional().describe("L'ora menzionata, es. 'stasera', 'alle 15', 'nel pomeriggio'. Non normalizzare termini relativi come 'stasera'."),
+    max_cost: z.string().optional().describe("L'eventuale budget o costo massimo menzionato, es. '50 euro', 'sotto i 20'. Includi la valuta se specificata."),
+  }).describe("Le entità estratte dalla richiesta dell'utente. Includi solo le entità rilevanti per l'intento.")
+});
+
+const nluNode = async (state: AgentState): Promise<Partial<AgentState>> => {
+  const lastMessage = state.messages[state.messages.length - 1];
+  if (!(lastMessage instanceof HumanMessage)) {
+    return {}; 
+  }
+  const query = lastMessage.content as string;
+  console.log(`[NLU Node] Query utente: ${query}`);
+  const systemPrompt = new SystemMessage(
+    "Sei un assistente AI esperto nell'analisi del linguaggio naturale per un'applicazione chiamata CatchUp. " +
+    "Il tuo compito è identificare l'intento dell'utente e estrarre le entità rilevanti dalla sua richiesta. " +
+    "Fornisci sempre l'output utilizzando lo strumento 'nlu_tool' con lo schema fornito. " +
+    "Interpreta termini relativi come 'vicino a me', 'oggi', 'domani', 'stasera' e riportali così come sono nelle entità, non tentare di normalizzarli in valori assoluti in questa fase. " +
+    "Intenti possibili: 'search_deals' (per ricerca offerte/prenotazioni), 'greetings' (saluti), 'generic_chat' (conversazione generale), 'other' (altro)."
+  );
+  const llmWithTool = llm.withStructuredOutput(nluSchema, {
+    name: "nlu_tool", 
+  });
+  let parsedNLU: z.infer<typeof nluSchema>;
+  try {
+    parsedNLU = await llmWithTool.invoke([systemPrompt, lastMessage]) as z.infer<typeof nluSchema>;
+    console.log("[NLU Node] Output LLM (parsed):", JSON.stringify(parsedNLU, null, 2));
+  } catch (error) {
+    console.error("[NLU Node] Errore LLM per NLU:", error);
+    parsedNLU = { intent: "other", entities: {} };
+  }
+  const nluOutput: NLUOutput = {
+    intent: parsedNLU.intent,
+    entities: parsedNLU.entities,
+    original_query: query,
+  };
+  if (nluOutput.intent === "search_deals") {
+    const searchDealsData: SearchDealsData = { ...(state.searchDealsData || {}) }; 
+    if (nluOutput.entities.location && nluOutput.entities.location.toLowerCase() !== "vicino a me") {
+            searchDealsData.location = nluOutput.entities.location;
+    }
+    if (nluOutput.entities.date && !["oggi", "domani"].includes(nluOutput.entities.date.toLowerCase())) {
+            searchDealsData.date = nluOutput.entities.date; 
+    }
+    if (nluOutput.entities.time && !["stasera", "mattina", "pomeriggio"].includes(nluOutput.entities.time.toLowerCase())) {
+            searchDealsData.time = nluOutput.entities.time; 
+    }
+    console.log("[NLU Node] searchDealsData pre-compilato:", searchDealsData);
+    return { nluOutput, searchDealsData };
+  }
+  return { nluOutput };
+};
+
+const checkMissingDataNode = (
+  state: AgentState
+): "askLocation" | "askDate" | "askTime" | "askCost" | "confirmSearchParameters" | "handleFallback" => {
+  const { searchDealsData, nluOutput } = state;
+  if (nluOutput?.intent !== "search_deals") return "handleFallback"; 
+  if (!searchDealsData) return "handleFallback"; 
+  if (!searchDealsData.location || !searchDealsData.location_confirmed) return "askLocation";
+  if (!searchDealsData.date || !searchDealsData.date_confirmed) return "askDate";
+  if (!searchDealsData.time || !searchDealsData.time_confirmed) return "askTime";
+  if (!searchDealsData.max_cost_confirmed) return "askCost";
+  return "confirmSearchParameters";
+};
+
+const askLocationNode = async (state: AgentState): Promise<Partial<AgentState>> => {
+  const { searchDealsData, nluOutput } = state;
+  let messageContent = "Per quale luogo vorresti cercare le offerte?";
+  let is_awaiting_confirmation = false;
+  let confirmation_type: AgentState["confirmation_type"] = undefined;
+  const askForNearbyConfirmation = nluOutput?.entities?.location?.toLowerCase() === "vicino a me" || 
+                                 (!searchDealsData.location && !searchDealsData.location_confirmed);
+  if (askForNearbyConfirmation) {
+    messageContent = "Certo, posso cercare offerte per te. Vuoi che cerchi vicino a dove sei ora o preferisci specificare un altro luogo?";
+    is_awaiting_confirmation = true;
+    confirmation_type = "location_nearby";
+  } else if (searchDealsData.location && !searchDealsData.location_confirmed) {
+    messageContent = `Ok, per ${searchDealsData.location}, corretto? Oppure vuoi specificare un altro luogo?`;
+    is_awaiting_confirmation = true;
+    confirmation_type = "location_nearby"; 
+  }
+  return {
+    messages: [new AIMessage(messageContent)],
+    searchDealsData: { ...searchDealsData, last_asked_param: "location" },
+    is_awaiting_confirmation, confirmation_type,
+    last_agent_question: messageContent
+  };
+};
+
+const askDateNode = async (state: AgentState): Promise<Partial<AgentState>> => {
+  const { searchDealsData, nluOutput } = state;
+  const todayDMY = new Date().toLocaleDateString("it-IT", { day: "numeric", month: "long", year: "numeric" });
+  const todayYMD = new Date().toISOString().split("T")[0];
+  let messageContent = `Per quale data vorresti cercare? (es. domani, il 25 dicembre, o una data specifica come ${todayYMD})`;
+  let is_awaiting_confirmation = false;
+  let confirmation_type: AgentState["confirmation_type"] = undefined;
+  const askForTodayConfirmation = nluOutput?.entities?.date?.toLowerCase() === "oggi" || 
+                                (!searchDealsData.date && !searchDealsData.date_confirmed);
+  if (askForTodayConfirmation) {
+    messageContent = `Ottimo. Stai cercando offerte per oggi, ${todayDMY}, o per un'altra data?`;
+    is_awaiting_confirmation = true;
+    confirmation_type = "date_today";
+  } else if (searchDealsData.date && !searchDealsData.date_confirmed) {
+    messageContent = `Ok, per il ${searchDealsData.date}, corretto? Oppure vuoi specificare un'altra data?`;
+    is_awaiting_confirmation = true;
+    confirmation_type = "date_today"; 
+  }
+  return {
+    messages: [new AIMessage(messageContent)],
+    searchDealsData: { ...searchDealsData, last_asked_param: "date" },
+    is_awaiting_confirmation, confirmation_type,
+    last_agent_question: messageContent
+  };
+};
+
+const askTimeNode = async (state: AgentState): Promise<Partial<AgentState>> => {
+    const messageContent = "Perfetto. A che ora circa saresti interessato/a? (es. alle 14:00, in mattinata, nel pomeriggio)";
+    return {
+        messages: [new AIMessage(messageContent)],
+        searchDealsData: { ...state.searchDealsData, last_asked_param: "time" },
+        is_awaiting_confirmation: false,
+        last_agent_question: messageContent
+    };
+};
+
+const askCostNode = async (state: AgentState): Promise<Partial<AgentState>> => {
+  const messageContent = "Hai un budget massimo in mente per l'offerta, o una fascia di prezzo preferita? Questo è opzionale. Puoi dire 'salta' o 'nessuno'.";
+  return {
+    messages: [new AIMessage(messageContent)],
+    searchDealsData: { ...state.searchDealsData, last_asked_param: "max_cost" },
+    is_awaiting_confirmation: false,
+    last_agent_question: messageContent
+  };
+};
+
+const processUserInputNode = async (state: AgentState): Promise<Partial<AgentState>> => {
+  const lastUserMessage = state.messages[state.messages.length - 1];
+  if (!(lastUserMessage instanceof HumanMessage)) {
+    return { 
+        searchDealsData: { ...state.searchDealsData, last_asked_param: null }, 
+        is_awaiting_confirmation: false, 
+        last_agent_question: undefined 
+    };
+  }
+  const userInput = lastUserMessage.content as string;
+  const { searchDealsData, is_awaiting_confirmation, confirmation_type, last_agent_question } = state;
+  let updatedData = { ...searchDealsData };
+  let newMessages: BaseMessage[] = [];
+
+  const current_param_context = searchDealsData.last_asked_param || "none";
+  let assumption_description = "Nessuna assunzione specifica.";
+  if (is_awaiting_confirmation) {
+    if (confirmation_type === "location_nearby") assumption_description = `l'agente ha proposto di cercare 'vicino a te' o ha chiesto conferma per un luogo pre-compilato come '${updatedData.location}'.`;
+    if (confirmation_type === "date_today") assumption_description = `l'agente ha proposto di cercare per 'oggi' o ha chiesto conferma per una data pre-compilata come '${updatedData.date}'.`;
+    if (confirmation_type === "final_params") assumption_description = `l'agente ha chiesto conferma finale dei parametri: Luogo=${updatedData.location}, Data=${updatedData.date}, Ora=${updatedData.time}, Costo=${updatedData.max_cost || 'N/A'}.`;
+  }
+
+  const systemPromptParts = [
+    "Sei un assistente AI esperto nell'interpretare le risposte degli utenti per l'applicazione CatchUp.",
+    "Il tuo compito è analizzare la risposta dell'utente all'ultima domanda dell'agente e determinare l'azione dell'utente e l'eventuale valore fornito, utilizzando lo strumento 'user_response_analyzer' con lo schema fornito.",
+    `Contesto della conversazione: L'agente ha appena chiesto informazioni riguardo a: ${current_param_context}.`,
+  ];
+  if (is_awaiting_confirmation) {
+    systemPromptParts.push(`L'agente si aspettava una conferma per la seguente assunzione: ${assumption_description}`);
+  }
+  systemPromptParts.push(`Domanda specifica dell'agente a cui l'utente sta rispondendo: "${last_agent_question || 'N/A'}"`);
+  systemPromptParts.push(`Risposta dell'utente da analizzare: "${userInput}"`);
+  systemPromptParts.push("Istruzioni per l'interpretazione:");
+  systemPromptParts.push("1. Azione (action): Determina l'azione principale dell'utente tra le opzioni dello schema.");
+  systemPromptParts.push("2. Valore (value): Se l'utente fornisce un valore specifico, estrai questo valore. Non normalizzare valori come 'vicino a me', 'oggi', 'domani', 'stasera'.");
+  systemPromptParts.push(`3. Contesto del Parametro (parameter_context): Imposta questo campo a '${current_param_context}'.`);
+  systemPromptParts.push("Fornisci sempre l'output utilizzando lo strumento 'user_response_analyzer'.");
+  
+  const systemPrompt = new SystemMessage(systemPromptParts.join("\n"));
+  const llmWithParser = llm.withStructuredOutput(userInputInterpretationSchema, { name: "user_response_analyzer" });
+  
+  let interpretation: UserInputInterpretation;
+  try {
+    console.log("[Process User Input] Chiamata LLM per interpretazione. Contesto param:", current_param_context);
+    interpretation = await llmWithParser.invoke([systemPrompt, lastUserMessage]) as UserInputInterpretation;
+    console.log("[Process User Input] Interpretazione LLM:", JSON.stringify(interpretation, null, 2));
+  } catch (error) {
+    console.error("[Process User Input] Errore LLM:", error);
+    interpretation = { action: "unclear_or_off_topic", parameter_context: current_param_context as UserInputInterpretation['parameter_context'] };
+    newMessages.push(new AIMessage("Ops, ho avuto un piccolo problema a capire la tua risposta. Potresti provare a riformulare?"));
+  }
+
+  switch (interpretation.action) {
+    case "confirm_assumption":
+    case "confirm_final_parameters":
+      if (current_param_context === "location") {
+        if (updatedData.location && updatedData.location !== "nearby_confirmed") {
+            newMessages.push(new AIMessage(`Ok, confermato per ${updatedData.location}!`));
+        } else {
+            updatedData.location = "nearby_confirmed"; 
+            newMessages.push(new AIMessage("Ok, cercherò vicino a te!"));
+        }
+        updatedData.location_confirmed = true;
+      } else if (current_param_context === "date") {
+        if (updatedData.date && updatedData.date !== new Date().toISOString().split("T")[0]){
+             newMessages.push(new AIMessage(`Perfetto, per il ${updatedData.date}!`));
+        } else {
+            updatedData.date = new Date().toISOString().split("T")[0];
+            newMessages.push(new AIMessage("Perfetto, per oggi!"));
+        }
+        updatedData.date_confirmed = true;
+      } else if (current_param_context === "final_confirmation") {
+        newMessages.push(new AIMessage("Ottimo! Procedo con la ricerca."));
+      }
+      break;
+
+    case "deny_assumption":
+    case "deny_final_parameters_request_modification":
+      if (current_param_context === "location") {
+        updatedData.location = undefined; 
+        updatedData.location_confirmed = false;
+        newMessages.push(new AIMessage("Ok, allora dimmi dove vorresti cercare."));
+      } else if (current_param_context === "date") {
+        updatedData.date = undefined;
+        updatedData.date_confirmed = false;
+        newMessages.push(new AIMessage("Capito. Per quale data allora?"));
+      } else if (current_param_context === "final_confirmation") {
+        newMessages.push(new AIMessage("Ok, nessun problema. Dimmi cosa vuoi modificare, o ricominciamo la raccolta dei dati."));
+        updatedData.location_confirmed = false;
+        updatedData.date_confirmed = false;
+        updatedData.time_confirmed = false;
+        updatedData.max_cost_confirmed = false; 
+      }
+      break;
+
+    case "provide_value":
+    case "provide_location_specific":
+    case "provide_date_specific":
+    case "provide_time_specific":
+    case "provide_cost_specific":
+      const providedValue = interpretation.value;
+      if (providedValue) {
+        if (current_param_context === "location") {
+          updatedData.location = providedValue;
+          updatedData.location_confirmed = true;
+          newMessages.push(new AIMessage(`Ok, luogo impostato su: ${providedValue}`));
+        } else if (current_param_context === "date") {
+          if (providedValue.toLowerCase() === "oggi") {
+            updatedData.date = new Date().toISOString().split("T")[0];
+            newMessages.push(new AIMessage(`Ok, per oggi (${updatedData.date})!`));
+          } else if (providedValue.toLowerCase() === "domani") {
+            const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+            updatedData.date = tomorrow.toISOString().split("T")[0];
+            newMessages.push(new AIMessage(`Ok, per domani (${updatedData.date})!`));
+          } else if (providedValue.match(/^\d{4}-\d{2}-\d{2}$/)) { 
+            updatedData.date = providedValue;
+            newMessages.push(new AIMessage(`Ok, data impostata su: ${providedValue}`));
+          } else {
+            newMessages.push(new AIMessage("Non ho riconosciuto il formato della data. Prova con YYYY-MM-DD, 'oggi' o 'domani'."));
+            updatedData.date_confirmed = false; 
+            break; 
+          }
+          updatedData.date_confirmed = true;
+        } else if (current_param_context === "time") {
+          if (providedValue.match(/^\d{1,2}:\d{2}$/)) { 
+             updatedData.time = providedValue;
+             updatedData.time_confirmed = true;
+             newMessages.push(new AIMessage(`Ok, ora impostata su: ${providedValue}`));
+          } else {
+            newMessages.push(new AIMessage("Non ho riconosciuto il formato dell'ora. Prova con HH:MM (es. 14:30)."));
+            updatedData.time_confirmed = false;
+            break;
+          }
+        } else if (current_param_context === "max_cost") {
+          const cost = parseFloat(providedValue.replace(/[^\d.-]/g, ''));
+          if (!isNaN(cost)) {
+            updatedData.max_cost = cost;
+            newMessages.push(new AIMessage(`Ok, budget massimo impostato a ${cost}.`));
+          } else {
+            newMessages.push(new AIMessage("Non ho capito l'importo. Specifica un numero."));
+            updatedData.max_cost_confirmed = false; 
+            break;
+          }
+          updatedData.max_cost_confirmed = true; 
+        }
+      } else {
+        newMessages.push(new AIMessage("Non ho colto il valore che hai fornito. Potresti riprovare?"));
+        if(current_param_context === "location") updatedData.location_confirmed = false;
+        if(current_param_context === "date") updatedData.date_confirmed = false;
+        if(current_param_context === "time") updatedData.time_confirmed = false;
+        if(current_param_context === "max_cost") updatedData.max_cost_confirmed = false;
+      }
+      break;
+
+    case "skip_parameter":
+      if (current_param_context === "max_cost") {
+        updatedData.max_cost = undefined;
+        updatedData.max_cost_confirmed = true; 
+        newMessages.push(new AIMessage("Ok, nessun budget specifico."));
+      } else {
+        newMessages.push(new AIMessage(`Non è possibile saltare il parametro ${current_param_context}. Ho bisogno di questa informazione.`));
+        if(current_param_context === "location") updatedData.location_confirmed = false;
+        if(current_param_context === "date") updatedData.date_confirmed = false;
+        if(current_param_context === "time") updatedData.time_confirmed = false;
+      }
+      break;
+
+    case "request_clarification":
+    case "unclear_or_off_topic":
+    default:
+      newMessages.push(new AIMessage("Non ho capito bene. Potresti riformulare la tua risposta o chiedere aiuto?"));
+      if(current_param_context === "location") updatedData.location_confirmed = false;
+      if(current_param_context === "date") updatedData.date_confirmed = false;
+      if(current_param_context === "time") updatedData.time_confirmed = false;
+      if(current_param_context === "max_cost") updatedData.max_cost_confirmed = false;
+      break;
+  }
+
+  return {
+    messages: newMessages.length > 0 ? newMessages : undefined,
+    searchDealsData: { ...updatedData, last_asked_param: null },
+    is_awaiting_confirmation: false,
+    confirmation_type: undefined,
+    last_agent_question: undefined 
+  };
+};
+
+const confirmSearchParametersNode = async (state: AgentState): Promise<Partial<AgentState>> => {
+  const { location, date, time, max_cost } = state.searchDealsData;
+  const message = `Ok, ricapitolando: cerco offerte per ${location} il ${date} alle ${time}${max_cost ? ` con un budget massimo di ${max_cost}` : ''}. Confermi? (sì/no o modifica)`;
+  return {
+    messages: [new AIMessage(message)],
+    is_awaiting_confirmation: true,
+    confirmation_type: "final_params",
+    searchDealsData: { ...state.searchDealsData, last_asked_param: "final_confirmation" }, 
+    last_agent_question: message
+  };
+};
+
+const searchDealsSupabaseNodeMock = async (state: AgentState): Promise<Partial<AgentState>> => {
+  const { location, date, time, max_cost } = state.searchDealsData;
+  const results = [
+    { name: "Offerta Speciale Pizza", details: `Pizza Margherita a 5€ vicino a ${location} per ${date} alle ${time}` },
+    { name: "Taglio Capelli Scontato", details: `Taglio uomo/donna a 15€ in zona ${location} per ${date} alle ${time}` },
+  ];
+  const message = `Ho trovato ${results.length} offerte per te:
+1. ${results[0].name}: ${results[0].details}
+2. ${results[1].name}: ${results[1].details}`;
+  return { messages: [new AIMessage(message)], last_agent_question: undefined };
+};
+
+// Nodo handleFallbackNode AGGIORNATO con LLM
+const handleFallbackNode = async (state: AgentState): Promise<Partial<AgentState>> => {
+  const lastUserMessage = state.messages.filter(m => m instanceof HumanMessage).pop()?.content || "la tua ultima richiesta";
+  const nluIntent = state.nluOutput?.intent;
+  let contextDescription = `L'utente ha detto: "${lastUserMessage}".`;
+  if (nluIntent && nluIntent !== "other") {
+    contextDescription += ` L'intento rilevato era '${nluIntent}', ma qualcosa è andato storto nel flusso.`;
+  }
+
+  const fallbackSystemPrompt = new SystemMessage(
+    "Sei un assistente AI amichevole e d'aiuto per l'applicazione CatchUp. " +
+    "Qualcosa non ha funzionato come previsto nel gestire la richiesta dell'utente, o l'utente ha detto qualcosa di completamente inatteso. " +
+    "Il tuo compito è generare un messaggio di scuse cortese e offrire aiuto. " +
+    "Considera il contesto fornito per rendere il messaggio più pertinente, se possibile. " +
+    "Suggerisci all'utente di riformulare la sua richiesta o chiedi se può specificare meglio cosa vorrebbe fare. " +
+    "Mantieni il messaggio breve e chiaro."
+  );
+  
+  let fallbackMessageContent = "Mi dispiace, non sono riuscito a capire bene. Potresti riformulare la tua richiesta o dirmi cosa vorresti fare?";
+  try {
+    console.log("[Fallback Node] Generazione messaggio di fallback contestuale. Contesto:", contextDescription);
+    const response = await llm.invoke([fallbackSystemPrompt, new HumanMessage(contextDescription)]);
+    fallbackMessageContent = response.content as string;
+    console.log("[Fallback Node] Messaggio generato:", fallbackMessageContent);
+  } catch (error) {
+    console.error("[Fallback Node] Errore LLM durante la generazione del messaggio di fallback:", error);
+    // Usa il messaggio statico se l'LLM fallisce
+  }
+  
+  return {
+    messages: [new AIMessage(fallbackMessageContent)],
+    last_agent_question: undefined
+  };
+};
+
+
+// Definizione del Grafo LangGraph
+const workflow = new StateGraph<AgentState>({
+  channels: {
+    messages: { value: (x: BaseMessage[], y: BaseMessage[]) => x.concat(y), default: () => [] },
+    nluOutput: { value: (x,y) => y, default: () => undefined },
+    searchDealsData: { value: (x,y) => ({...x, ...y}), default: () => ({}) },
+    is_awaiting_confirmation: { value: (x,y) => y, default: () => false },
+    confirmation_type: { value: (x,y) => y, default: () => undefined },
+    last_agent_question: {value: (x,y) => y, default: () => undefined}
+  },
+});
+
+workflow.addNode("nlu", nluNode);
+workflow.addNode("checkMissingData", checkMissingDataNode as any); 
+workflow.addNode("askLocation", askLocationNode);
+workflow.addNode("askDate", askDateNode);
+workflow.addNode("askTime", askTimeNode);
+workflow.addNode("askCost", askCostNode);
+workflow.addNode("processUserInput", processUserInputNode);
+workflow.addNode("confirmSearchParameters", confirmSearchParametersNode);
+workflow.addNode("searchDeals", searchDealsSupabaseNodeMock);
+workflow.addNode("handleFallback", handleFallbackNode);
+
+
+workflow.addEdge(START, "nlu");
+
+workflow.addConditionalEdges("nlu", 
+    (state: AgentState) => state.nluOutput?.intent === "search_deals" ? "checkMissingData" : "handleFallback",
+    { "checkMissingData": "checkMissingData", "handleFallback": "handleFallback" }
+);
+
+workflow.addConditionalEdges("checkMissingData",
+  (state: AgentState) => {
+    // Aggiungiamo un controllo per vedere se siamo in un ciclo di conferma finale
+    // e l'utente ha confermato. In tal caso, andiamo a searchDeals.
+    if (state.searchDealsData.last_asked_param === "final_confirmation" && 
+        state.searchDealsData.location_confirmed &&
+        state.searchDealsData.date_confirmed &&
+        state.searchDealsData.time_confirmed &&
+        state.searchDealsData.max_cost_confirmed) { // max_cost_confirmed indica che è stato gestito (anche se saltato)
+            return "searchDeals";
+        }
+    return checkMissingDataNode(state); // Altrimenti, usa la logica standard
+  },
+  {
+    askLocation: "askLocation", askDate: "askDate", askTime: "askTime", 
+    askCost: "askCost", confirmSearchParameters: "confirmSearchParameters",
+    searchDeals: "searchDeals", // Nuovo arco per andare direttamente alla ricerca
+    handleFallback: "handleFallback", 
+  }
+);
+
+workflow.addEdge("askLocation", "processUserInput");
+workflow.addEdge("askDate", "processUserInput");
+workflow.addEdge("askTime", "processUserInput");
+workflow.addEdge("askCost", "processUserInput");
+workflow.addEdge("confirmSearchParameters", "processUserInput"); 
+
+workflow.addEdge("processUserInput", "checkMissingData"); 
+
+workflow.addEdge("searchDeals", END);
+workflow.addEdge("handleFallback", END);
+
+const app = workflow.compile();
+
+async function runConversation() {
+  console.log("Avvio conversazione con l'agente...");
+  let currentState: AgentState = {
+    messages: [],
+    searchDealsData: {},
+    is_awaiting_confirmation: false,
+  };
+  const inputs = [
+    "Ciao, potresti aiutarmi a trovare un parrucchiere a Milano per domani mattina?",
+    // "sì, vicino a me va bene",          
+    // "per oggi va bene",                 
+    // "alle 19:30",                       
+    "non ho un budget specifico", // salta costo
+    "sì, tutto corretto!" // conferma finale
+    // "Cosa puoi fare?" // Test fallback
+  ];
+  for (const input of inputs) {
+    console.log(`\nUTENTE: ${input}`);
+    const nextState: Partial<AgentState> = {messages: [new HumanMessage(input)]};
+    // Per il testing, è meglio passare l'intero stato precedente se si vuole che i campi come searchDealsData persistano correttamente
+    // tra le chiamate invoke se non sono esplicitamente ritornati e riassegnati.
+    // LangGraph gestisce l'accumulo dei messaggi nel canale 'messages', ma gli altri canali custom
+    // dipendono da come sono definiti (value vs. default vs. reducer).
+    // Per semplicità qui, assumiamo che lo stato venga passato e aggiornato correttamente dal framework
+    // o che i nodi ritornino sempre lo stato completo o le modifiche necessarie.
+    const result = await app.invoke(currentState.messages.length > 0 ? currentState : nextState, {recursionLimit: 100, configurable: { thread_id: "test-thread-v4" } });
+    currentState = result;
+    const aiMessages = result.messages.filter((msg: BaseMessage) => msg instanceof AIMessage && msg.content !== "");
+    if (aiMessages.length > 0) {
+      aiMessages.forEach((aiMsg: BaseMessage) => console.log(`AGENTE: ${aiMsg.content}`));
+    } else {
+      console.log("AGENTE: (Nessuna risposta AI diretta in questo passaggio, solo transizione di stato)");
+    }
+    console.log("--- Stato nluOutput attuale ---");
+    console.log(currentState.nluOutput);
+    console.log("--- Stato searchDealsData attuale ---");
+    console.log(currentState.searchDealsData);
+    console.log("-----------------------------------");
+    const lastAIMessageContent = aiMessages.pop()?.content.toString();
+    if (lastAIMessageContent && lastAIMessageContent.startsWith("Ho trovato")) {
+        console.log("\nRicerca completata!");
+        break;
+    }
+     if (lastAIMessageContent && currentState.nluOutput?.intent !== 'search_deals' && currentState.nluOutput?.intent !== 'greetings' ){
+        console.log("\nConversazione di fallback terminata.");
+        break;
+    }
+  }
+}
+// runConversation(); 
+console.log("Script caricato. Decommenta 'runConversation()' alla fine del file per eseguirlo.");
+export { app as searchDealsApp, AgentState as SearchDealsAgentState }; 
+
